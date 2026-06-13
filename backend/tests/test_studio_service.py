@@ -1,4 +1,5 @@
 from datetime import date
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -428,3 +429,93 @@ async def test_items_ordered_canonically(db_session, studio_user, wardrobe_items
     types_in_order = [oi.item.type for oi in sorted(outfit.items, key=lambda x: x.position)]
     assert types_in_order.index("t-shirt") < types_in_order.index("jeans")
     assert types_in_order.index("jeans") < types_in_order.index("sneakers")
+
+
+@pytest.mark.asyncio
+async def test_wear_today_explicit_date(db_session, studio_user, wardrobe_items):
+    """When scheduled_for is explicitly provided, wear_today uses that exact date
+    regardless of the user's timezone or server time."""
+    service = StudioService(db_session)
+    shirt, jeans, sneakers = wardrobe_items[0], wardrobe_items[1], wardrobe_items[2]
+
+    template = await service.create_from_scratch(
+        user=studio_user,
+        item_ids=[shirt.id, jeans.id, sneakers.id],
+        occasion="formal",
+        name="Explicit date look",
+        scheduled_for=None,
+        mark_worn=False,
+        source_item_id=None,
+    )
+    await db_session.commit()
+
+    explicit_date = date(2026, 12, 25)
+    wear = await service.wear_today(
+        user=studio_user, template_id=template.id, scheduled_for=explicit_date
+    )
+    await db_session.commit()
+
+    assert wear.scheduled_for == explicit_date
+    assert wear.feedback is not None
+    assert wear.feedback.worn_at == explicit_date
+
+    await db_session.refresh(shirt)
+    assert shirt.wear_count == 1
+    assert shirt.last_worn_at == explicit_date
+
+
+@pytest.mark.asyncio
+async def test_wear_today_default_uses_user_timezone(db_session, wardrobe_items):
+    """When scheduled_for is omitted (None), wear_today must fall back to the
+    user-timezone-aware 'today' from get_user_today, not the server-local date.today().
+
+    We create a user with a non-UTC timezone and mock get_user_today to return a
+    date that is deliberately different from date.today(), proving the code path
+    goes through the timezone utility."""
+    uid = uuid4()
+    tz_user = User(
+        id=uid,
+        external_id=f"tz-user-{uid}",
+        email=f"tz-user-{uid}@example.com",
+        display_name="Timezone Tester",
+        timezone="Pacific/Kiritimati",  # UTC+14, often a different calendar day
+        is_active=True,
+    )
+    db_session.add(tz_user)
+    await db_session.commit()
+    await db_session.refresh(tz_user)
+
+    # Ensure wardrobe items belong to this timezone user
+    for item in wardrobe_items:
+        item.user_id = tz_user.id
+    await db_session.flush()
+
+    service = StudioService(db_session)
+    shirt, jeans, sneakers = wardrobe_items[0], wardrobe_items[1], wardrobe_items[2]
+
+    template = await service.create_from_scratch(
+        user=tz_user,
+        item_ids=[shirt.id, jeans.id, sneakers.id],
+        occasion="casual",
+        name="TZ look",
+        scheduled_for=None,
+        mark_worn=False,
+        source_item_id=None,
+    )
+    await db_session.commit()
+
+    # Mock get_user_today to return a date that is NOT today's server date.
+    # This proves the code calls get_user_today(user) rather than date.today().
+    mock_user_today = date(2026, 1, 15)
+    with patch("app.services.studio_service.get_user_today", return_value=mock_user_today):
+        wear = await service.wear_today(
+            user=tz_user, template_id=template.id, scheduled_for=None
+        )
+    await db_session.commit()
+
+    assert wear.scheduled_for == mock_user_today
+    assert wear.feedback is not None
+    assert wear.feedback.worn_at == mock_user_today
+
+    await db_session.refresh(shirt)
+    assert shirt.last_worn_at == mock_user_today
