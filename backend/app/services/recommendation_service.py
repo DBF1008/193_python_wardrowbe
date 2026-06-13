@@ -3,6 +3,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -71,6 +72,100 @@ class RecommendationContext:
 RECOMMENDATION_PROMPT = load_prompt("recommendation")
 
 
+class CandidateExclusionReason(StrEnum):
+    """Why a ready item did not make it into the candidate pool."""
+
+    NEEDS_WASH = "needs_wash"
+    ARCHIVED = "archived"
+    UNKNOWN_TYPE = "unknown_type"
+    EXCLUDED_BY_REQUEST = "excluded_by_request"
+    AUTO_REJECTED_TODAY = "auto_rejected_today"
+    EXCLUDED_BY_PREFERENCE = "excluded_by_preference"
+
+
+@dataclass
+class ExcludedItem:
+    item: ClothingItem
+    reason: CandidateExclusionReason
+
+
+@dataclass
+class PreviewCandidate:
+    item: ClothingItem
+    score: float
+    mandatory: bool
+    signals: dict[str, float]
+
+
+@dataclass
+class PreviewRecommendation:
+    item_ids: list[UUID]
+    items: list[ClothingItem]
+    headline: str | None
+    highlights: list[str] | None
+    styling_tip: str | None
+
+
+@dataclass
+class RecommendationPreview:
+    occasion: str
+    time_of_day: str
+    weather: WeatherData
+    weather_source: str
+    candidates: list[PreviewCandidate]
+    excluded: list[ExcludedItem]
+    mandatory_item_ids: list[UUID]
+    unhonored_mandatory_ids: list[UUID]
+    sufficient: bool
+    total_ready: int
+    recommendation: PreviewRecommendation | None = None
+    ai_error: str | None = None
+
+
+def classify_candidate_items(
+    items: list[ClothingItem],
+    *,
+    exclude_request: set[UUID],
+    auto_rejected: set[UUID],
+    excluded_pref: set[UUID],
+    mandatory: set[UUID],
+) -> tuple[list[ClothingItem], list[ExcludedItem]]:
+    """Split ready items into the kept candidate pool and excluded-with-reason.
+
+    The rule order mirrors the production generation flow so the preview is faithful:
+    archived items are dropped first (production's force-include query filters
+    ``is_archived == False`` and so can never re-add them), then mandatory items are kept
+    unconditionally (mirroring force-include, which re-adds needs-wash / excluded items),
+    then the remaining soft filters apply in the same order as ``get_candidate_items``.
+    """
+    kept: list[ClothingItem] = []
+    excluded: list[ExcludedItem] = []
+    for item in items:
+        if item.is_archived:
+            excluded.append(ExcludedItem(item, CandidateExclusionReason.ARCHIVED))
+            continue
+        if item.id in mandatory:
+            kept.append(item)
+            continue
+        if item.needs_wash:
+            excluded.append(ExcludedItem(item, CandidateExclusionReason.NEEDS_WASH))
+            continue
+        if not item.type or item.type == "unknown":
+            excluded.append(ExcludedItem(item, CandidateExclusionReason.UNKNOWN_TYPE))
+            continue
+        if item.id in exclude_request:
+            excluded.append(ExcludedItem(item, CandidateExclusionReason.EXCLUDED_BY_REQUEST))
+            continue
+        if item.id in auto_rejected:
+            excluded.append(ExcludedItem(item, CandidateExclusionReason.AUTO_REJECTED_TODAY))
+            continue
+        if item.id in excluded_pref:
+            excluded.append(ExcludedItem(item, CandidateExclusionReason.EXCLUDED_BY_PREFERENCE))
+            continue
+        kept.append(item)
+    return kept, excluded
+
+
 class RecommendationService:
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -98,18 +193,19 @@ class RecommendationService:
         if not items:
             return []
 
-        items = [i for i in items if not i.needs_wash]
-        items = [i for i in items if i.type and i.type != "unknown"]
-
-        if exclude_items:
-            exclude_set = set(exclude_items)
-            items = [i for i in items if i.id not in exclude_set]
-
-        if preferences and preferences.excluded_item_ids:
-            excluded = set(preferences.excluded_item_ids)
-            items = [i for i in items if i.id not in excluded]
-
-        return items
+        excluded_pref = (
+            set(preferences.excluded_item_ids)
+            if preferences and preferences.excluded_item_ids
+            else set()
+        )
+        kept, _ = classify_candidate_items(
+            items,
+            exclude_request=set(exclude_items) if exclude_items else set(),
+            auto_rejected=set(),
+            excluded_pref=excluded_pref,
+            mandatory=set(),
+        )
+        return kept
 
     async def _get_recently_worn_dates(self, user: User) -> dict[UUID, date]:
         result = await self.db.execute(
@@ -870,6 +966,246 @@ class RecommendationService:
             raise AIRecommendationError(
                 "AI service is not available. Please check your AI endpoint configuration in Settings."
             ) from e
+
+    async def preview_recommendation(
+        self,
+        user: User,
+        occasion: str,
+        weather_override: WeatherData | None = None,
+        exclude_items: list[UUID] | None = None,
+        include_items: list[UUID] | None = None,
+        time_of_day: str | None = None,
+        include_ai_reasoning: bool = False,
+    ) -> RecommendationPreview:
+        """Dry-run of a recommendation. Never writes to the DB or the suggestion cache.
+
+        Mirrors the weather/occasion/candidate/scoring logic of
+        ``generate_recommendation`` so it can be used to troubleshoot ``/outfits/suggest``,
+        but materializes nothing. The AI is invoked only when ``include_ai_reasoning`` is
+        true, and even then the result is not persisted.
+        """
+        exclude_items = exclude_items or []
+        include_items = include_items or []
+
+        if not time_of_day:
+            time_of_day = get_time_of_day(user)
+
+        # Auto-rejected items are surfaced as their own reason instead of being folded
+        # into exclude_items (which is what the production flow does).
+        auto_rejected = await self._get_today_rejected_item_ids(user, occasion)
+
+        if weather_override:
+            weather = weather_override
+            weather_source = "override"
+        else:
+            if user.location_lat is None or user.location_lon is None:
+                raise ValueError("User location not set. Please set location in settings.")
+            try:
+                weather = await self.weather_service.get_current_weather(
+                    float(user.location_lat), float(user.location_lon)
+                )
+            except WeatherServiceError as e:
+                logger.error(f"Weather service failed: {e}")
+                raise ValueError(
+                    "Could not fetch weather data. Please try again or provide weather manually."
+                ) from e
+            weather_source = "live"
+
+        preferences = user.preferences
+
+        # Fetch all READY items. Unlike get_candidate_items we do NOT filter
+        # is_archived here so archived-but-ready items can be reported with a reason.
+        result = await self.db.execute(
+            select(ClothingItem).where(
+                and_(
+                    ClothingItem.user_id == user.id,
+                    ClothingItem.status == ItemStatus.ready,
+                )
+            )
+        )
+        raw_items = list(result.scalars().all())
+
+        mandatory_set = set(include_items)
+        excluded_pref = (
+            set(preferences.excluded_item_ids)
+            if preferences and preferences.excluded_item_ids
+            else set()
+        )
+        kept, excluded = classify_candidate_items(
+            raw_items,
+            exclude_request=set(exclude_items),
+            auto_rejected=auto_rejected,
+            excluded_pref=excluded_pref,
+            mandatory=mandatory_set,
+        )
+
+        kept_ids = {i.id for i in kept}
+        unhonored_mandatory_ids = [iid for iid in include_items if iid not in kept_ids]
+        sufficient = len(kept) >= 2
+
+        # Scoring context — identical to the production flow.
+        recently_worn_dates = await self._get_recently_worn_dates(user)
+        good_pairs = await self._get_good_item_pairs(user.id)
+        learned_prefs = await self._get_learned_preferences(user.id, occasion=occasion)
+        user_today = get_user_today(user)
+        lat = float(user.location_lat) if user.location_lat is not None else None
+        current_season = get_season(user_today.month, lat)
+
+        scored = score_items(
+            items=kept,
+            weather=weather,
+            occasion=occasion,
+            preferences=preferences,
+            user_today=user_today,
+            current_season=current_season,
+            learned_prefs=learned_prefs,
+            good_pairs=good_pairs,
+            recently_worn_dates=recently_worn_dates,
+            mandatory_item_ids=mandatory_set or None,
+        )
+
+        candidates = [
+            PreviewCandidate(
+                item=si.item,
+                score=round(si.score, 4),
+                mandatory=si.item.id in mandatory_set,
+                signals={
+                    "weather": round(si.weather_score, 3),
+                    "formality": round(si.formality_score, 3),
+                    "season": round(si.season_score, 3),
+                    "recency": round(si.recency_score, 3),
+                    "preference": round(si.preference_score, 3),
+                    "usage": round(si.usage_score, 3),
+                    "pair_bonus": round(si.pair_bonus, 3),
+                },
+            )
+            for si in scored
+        ]
+
+        preview = RecommendationPreview(
+            occasion=occasion,
+            time_of_day=time_of_day,
+            weather=weather,
+            weather_source=weather_source,
+            candidates=candidates,
+            excluded=excluded,
+            mandatory_item_ids=[i.id for i in kept if i.id in mandatory_set],
+            unhonored_mandatory_ids=unhonored_mandatory_ids,
+            sufficient=sufficient,
+            total_ready=len(raw_items),
+        )
+
+        if include_ai_reasoning and sufficient:
+            try:
+                preview.recommendation = await self._generate_ai_preview(
+                    user=user,
+                    occasion=occasion,
+                    time_of_day=time_of_day,
+                    weather=weather,
+                    preferences=preferences,
+                    scored=scored,
+                    good_pairs=good_pairs,
+                    learned_prefs=learned_prefs,
+                    include_items=include_items,
+                    user_today=user_today,
+                )
+            except Exception as e:
+                logger.warning(f"AI preview reasoning failed: {e}")
+                preview.ai_error = (
+                    "AI service is not available. Showing deterministic preview only."
+                )
+        elif include_ai_reasoning and not sufficient:
+            preview.ai_error = "Not enough candidate items to generate a recommendation."
+
+        return preview
+
+    async def _generate_ai_preview(
+        self,
+        *,
+        user: User,
+        occasion: str,
+        time_of_day: str,
+        weather: WeatherData,
+        preferences: UserPreference | None,
+        scored: list,
+        good_pairs: dict[UUID, list[UUID]],
+        learned_prefs: dict,
+        include_items: list[UUID],
+        user_today: date,
+    ) -> PreviewRecommendation:
+        """Run the AI to produce a single recommended combo for preview only.
+
+        Reuses the exact prompt-building of the production flow but does NOT persist
+        anything (no _materialize_outfit, no push_suggestions).
+        """
+        ai_endpoints = (
+            preferences.ai_endpoints if preferences and preferences.ai_endpoints else None
+        )
+        ai_service = AIService(endpoints=ai_endpoints)
+
+        items_text, number_map = self._format_items_for_prompt(scored, good_pairs, user_today)
+        mandatory_items_section = self._format_mandatory_items_section(include_items, number_map)
+        worn_combinations = await self._get_recently_worn_outfit_combinations(user, days=7)
+        preferences_text = self._format_preferences_for_prompt(
+            preferences,
+            learned_prefs,
+            worn_combinations,
+            number_map,
+            occasion=occasion,
+            body_measurements=getattr(user, "body_measurements", None),
+        )
+
+        prompt = RECOMMENDATION_PROMPT.format(
+            occasion=occasion,
+            time_of_day=time_of_day,
+            temperature=weather.temperature,
+            feels_like=weather.feels_like,
+            condition=weather.condition,
+            precipitation_chance=weather.precipitation_chance,
+            preferences_text=preferences_text,
+            items_text=items_text,
+            mandatory_items_section=mandatory_items_section,
+        )
+
+        result = await ai_service.generate_text(prompt, return_metadata=True)
+        outfit_list = self._parse_multi_outfit_response(result.content)
+        first = outfit_list[0] if outfit_list else {}
+
+        valid_ids: list[UUID] = []
+        for num in first.get("items", []):
+            try:
+                num_int = int(num)
+            except (ValueError, TypeError):
+                continue
+            if num_int in number_map:
+                valid_ids.append(number_map[num_int])
+
+        seen: set[UUID] = set()
+        unique_ids: list[UUID] = []
+        for iid in valid_ids:
+            if iid not in seen:
+                seen.add(iid)
+                unique_ids.append(iid)
+        valid_ids = unique_ids
+
+        if valid_ids:
+            type_result = await self.db.execute(
+                select(ClothingItem.id, ClothingItem.type).where(ClothingItem.id.in_(valid_ids))
+            )
+            item_type_map = {row.id: (row.type or "").lower() for row in type_result}
+            valid_ids = deduplicate_by_body_slot(valid_ids, item_type_map)
+
+        by_id = {si.item.id: si.item for si in scored}
+        items = [by_id[iid] for iid in valid_ids if iid in by_id]
+
+        highlights = first.get("highlights")
+        return PreviewRecommendation(
+            item_ids=valid_ids,
+            items=items,
+            headline=first.get("headline") or first.get("reasoning"),
+            highlights=highlights if isinstance(highlights, list) else None,
+            styling_tip=first.get("styling_tip") or first.get("style_notes"),
+        )
 
 
 class InsufficientWardrobeError(Exception):

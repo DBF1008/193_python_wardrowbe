@@ -27,7 +27,9 @@ from app.services.learning_service import LearningService
 from app.services.outfit_service import OutfitListFilters, OutfitService
 from app.services.recommendation_service import (
     AIRecommendationError,
+    CandidateExclusionReason,
     InsufficientWardrobeError,
+    RecommendationPreview,
     RecommendationService,
 )
 from app.services.studio_service import (
@@ -112,6 +114,34 @@ class SuggestRequest(BaseModel):
     include_items: list[UUID] = Field(default_factory=list, description="Items to include")
 
 
+class SuggestPreviewRequest(SuggestRequest):
+    include_ai_reasoning: bool = False
+
+
+def _resolve_occasion(user: User, requested: str | None) -> str:
+    if requested is not None:
+        return requested
+    if user.preferences and user.preferences.default_occasion:
+        return user.preferences.default_occasion
+    return "casual"
+
+
+def _weather_override_to_data(w: WeatherOverrideRequest) -> WeatherData:
+    return WeatherData(
+        temperature=w.temperature,
+        feels_like=w.feels_like or w.temperature,
+        humidity=w.humidity,
+        precipitation_chance=w.precipitation_chance,
+        precipitation_mm=0,
+        wind_speed=0,
+        condition=w.condition,
+        condition_code=0,
+        is_day=True,
+        uv_index=0,
+        timestamp=datetime.utcnow(),
+    )
+
+
 class OutfitItemResponse(BaseModel):
     id: UUID
     type: str
@@ -137,6 +167,75 @@ class OutfitItemResponse(BaseModel):
         if self.thumbnail_path:
             return sign_image_url(self.thumbnail_path)
         return None
+
+
+REASON_MESSAGES: dict[CandidateExclusionReason, str] = {
+    CandidateExclusionReason.NEEDS_WASH: "In the laundry — marked as needs washing.",
+    CandidateExclusionReason.ARCHIVED: "Archived and not available for suggestions.",
+    CandidateExclusionReason.UNKNOWN_TYPE: "Missing or unknown clothing type — needs tagging.",
+    CandidateExclusionReason.EXCLUDED_BY_REQUEST: "Excluded by this request (exclude_items).",
+    CandidateExclusionReason.AUTO_REJECTED_TODAY: "Already rejected for this occasion today.",
+    CandidateExclusionReason.EXCLUDED_BY_PREFERENCE: "Hidden by your wardrobe preferences.",
+}
+
+
+class PreviewCandidateResponse(BaseModel):
+    id: UUID
+    type: str | None = None
+    subtype: str | None = None
+    name: str | None = None
+    primary_color: str | None = None
+    colors: list[str] = []
+    thumbnail_path: str | None = None
+    score: float
+    mandatory: bool
+    signals: dict[str, float] = {}
+
+    @computed_field
+    @property
+    def thumbnail_url(self) -> str | None:
+        if self.thumbnail_path:
+            return sign_image_url(self.thumbnail_path)
+        return None
+
+
+class PreviewExcludedResponse(BaseModel):
+    id: UUID
+    type: str | None = None
+    name: str | None = None
+    thumbnail_path: str | None = None
+    reason: str
+    reason_message: str
+
+    @computed_field
+    @property
+    def thumbnail_url(self) -> str | None:
+        if self.thumbnail_path:
+            return sign_image_url(self.thumbnail_path)
+        return None
+
+
+class PreviewRecommendationResponse(BaseModel):
+    item_ids: list[UUID]
+    items: list[OutfitItemResponse]
+    headline: str | None = None
+    highlights: list[str] | None = None
+    styling_tip: str | None = None
+
+
+class SuggestPreviewResponse(BaseModel):
+    occasion: str
+    time_of_day: str
+    weather: dict | None = None
+    weather_source: str
+    candidates: list[PreviewCandidateResponse]
+    excluded: list[PreviewExcludedResponse]
+    mandatory_item_ids: list[UUID]
+    unhonored_mandatory_ids: list[UUID]
+    sufficient: bool
+    counts: dict[str, int]
+    recommendation: PreviewRecommendationResponse | None = None
+    ai_error: str | None = None
 
 
 class WoreInsteadItem(BaseModel):
@@ -386,31 +485,13 @@ async def suggest_outfit(
     current_user: Annotated[User, Depends(get_current_user)],
 ) -> OutfitResponse:
     await rate_limit_by_user(str(current_user.id), "suggest", max_requests=10, window_seconds=60)
-    weather_override = None
-    if request.weather_override:
-        w = request.weather_override
-        weather_override = WeatherData(
-            temperature=w.temperature,
-            feels_like=w.feels_like or w.temperature,
-            humidity=w.humidity,
-            precipitation_chance=w.precipitation_chance,
-            precipitation_mm=0,
-            wind_speed=0,
-            condition=w.condition,
-            condition_code=0,
-            is_day=True,
-            uv_index=0,
-            timestamp=datetime.utcnow(),
-        )
+    weather_override = (
+        _weather_override_to_data(request.weather_override) if request.weather_override else None
+    )
 
     service = RecommendationService(db)
 
-    occasion = request.occasion
-    if occasion is None:
-        if current_user.preferences and current_user.preferences.default_occasion:
-            occasion = current_user.preferences.default_occasion
-        else:
-            occasion = "casual"
+    occasion = _resolve_occasion(current_user, request.occasion)
 
     try:
         outfit = await service.generate_recommendation(
@@ -444,6 +525,132 @@ async def suggest_outfit(
 
     wore_instead_map = await fetch_wore_instead_items_map(db, [outfit], user_id=current_user.id)
     return outfit_to_response(outfit, wore_instead_map, is_starter_suggestion=is_starter)
+
+
+def _weather_to_dict(w: WeatherData) -> dict:
+    return {
+        "temperature": w.temperature,
+        "feels_like": w.feels_like,
+        "condition": w.condition,
+        "precipitation_chance": w.precipitation_chance,
+        "humidity": w.humidity,
+        "wind_speed": w.wind_speed,
+    }
+
+
+def _preview_to_response(preview: RecommendationPreview) -> SuggestPreviewResponse:
+    candidates = [
+        PreviewCandidateResponse(
+            id=c.item.id,
+            type=c.item.type,
+            subtype=c.item.subtype,
+            name=c.item.name,
+            primary_color=c.item.primary_color,
+            colors=c.item.colors or [],
+            thumbnail_path=c.item.thumbnail_path,
+            score=c.score,
+            mandatory=c.mandatory,
+            signals=c.signals,
+        )
+        for c in preview.candidates
+    ]
+    excluded = [
+        PreviewExcludedResponse(
+            id=e.item.id,
+            type=e.item.type,
+            name=e.item.name,
+            thumbnail_path=e.item.thumbnail_path,
+            reason=e.reason.value,
+            reason_message=REASON_MESSAGES.get(e.reason, e.reason.value),
+        )
+        for e in preview.excluded
+    ]
+
+    recommendation = None
+    if preview.recommendation is not None:
+        rec = preview.recommendation
+        rec_items = [
+            OutfitItemResponse(
+                id=it.id,
+                type=it.type or "",
+                subtype=it.subtype,
+                name=it.name,
+                primary_color=it.primary_color,
+                colors=it.colors or [],
+                image_path=it.image_path,
+                thumbnail_path=it.thumbnail_path,
+                layer_type=None,
+                position=idx,
+            )
+            for idx, it in enumerate(rec.items)
+        ]
+        recommendation = PreviewRecommendationResponse(
+            item_ids=rec.item_ids,
+            items=rec_items,
+            headline=rec.headline,
+            highlights=rec.highlights,
+            styling_tip=rec.styling_tip,
+        )
+
+    return SuggestPreviewResponse(
+        occasion=preview.occasion,
+        time_of_day=preview.time_of_day,
+        weather=_weather_to_dict(preview.weather),
+        weather_source=preview.weather_source,
+        candidates=candidates,
+        excluded=excluded,
+        mandatory_item_ids=preview.mandatory_item_ids,
+        unhonored_mandatory_ids=preview.unhonored_mandatory_ids,
+        sufficient=preview.sufficient,
+        counts={
+            "total_ready": preview.total_ready,
+            "candidate_count": len(preview.candidates),
+            "excluded_count": len(preview.excluded),
+        },
+        recommendation=recommendation,
+        ai_error=preview.ai_error,
+    )
+
+
+@router.post("/suggest/preview", response_model=SuggestPreviewResponse)
+async def suggest_outfit_preview(
+    request: SuggestPreviewRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> SuggestPreviewResponse:
+    """Read-only dry-run of /outfits/suggest.
+
+    Explains which items would be considered, which were filtered out and why, the
+    weather/occasion that would be used, and (opt-in) the AI's chosen combination.
+    Never persists an outfit or touches the suggestion cache.
+    """
+    await rate_limit_by_user(
+        str(current_user.id), "suggest_preview", max_requests=20, window_seconds=60
+    )
+    weather_override = (
+        _weather_override_to_data(request.weather_override) if request.weather_override else None
+    )
+
+    service = RecommendationService(db)
+    occasion = _resolve_occasion(current_user, request.occasion)
+
+    try:
+        preview = await service.preview_recommendation(
+            user=current_user,
+            occasion=occasion,
+            weather_override=weather_override,
+            exclude_items=request.exclude_items,
+            include_items=request.include_items,
+            time_of_day=request.time_of_day,
+            include_ai_reasoning=request.include_ai_reasoning,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from None
+
+    return _preview_to_response(preview)
 
 
 @router.get("", response_model=OutfitListResponse)
