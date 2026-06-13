@@ -111,6 +111,48 @@ class RecommendationService:
 
         return items
 
+    async def _validate_mandatory_items(
+        self, include_items: list[UUID], user: User
+    ) -> list[ClothingItem]:
+        """Validate that all mandatory include_items are usable.
+
+        Raises MandatoryItemError if any item is missing, doesn't belong to the
+        user, is not ``ready``, or is archived.
+        """
+        result = await self.db.execute(
+            select(ClothingItem).where(
+                and_(
+                    ClothingItem.id.in_(include_items),
+                    ClothingItem.user_id == user.id,
+                )
+            )
+        )
+        found = {item.id: item for item in result.scalars().all()}
+
+        not_found = [iid for iid in include_items if iid not in found]
+        if not_found:
+            raise MandatoryItemError(
+                f"The following items do not belong to you or do not exist: "
+                f"{', '.join(str(i) for i in not_found)}"
+            )
+
+        invalid = []
+        valid_items = []
+        for iid in include_items:
+            item = found[iid]
+            if item.status != ItemStatus.ready or item.is_archived:
+                invalid.append(iid)
+            else:
+                valid_items.append(item)
+
+        if invalid:
+            raise MandatoryItemError(
+                f"The following items are not available (not ready or archived): "
+                f"{', '.join(str(i) for i in invalid)}"
+            )
+
+        return valid_items
+
     async def _get_recently_worn_dates(self, user: User) -> dict[UUID, date]:
         result = await self.db.execute(
             select(ClothingItem.id, ClothingItem.last_worn_at).where(
@@ -544,6 +586,7 @@ class RecommendationService:
         source: OutfitSource,
         number_map: dict[int, UUID],
         scheduled_date: date | None = None,
+        mandatory_item_ids: set[UUID] | None = None,
     ) -> Outfit:
         selected_numbers = outfit_data.get("items", [])
         valid_ids = []
@@ -566,15 +609,34 @@ class RecommendationService:
                 unique_ids.append(item_id)
         valid_ids = unique_ids
 
-        if not valid_ids:
+        if not valid_ids and not mandatory_item_ids:
             raise AIRecommendationError("AI did not select any valid items")
 
         # Deduplicate by body slot (e.g. prevent shorts + pants)
+        all_ids_for_dedup = list(valid_ids)
+        if mandatory_item_ids:
+            seen_for_dedup = set(valid_ids)
+            for mid in mandatory_item_ids:
+                if mid not in seen_for_dedup:
+                    all_ids_for_dedup.append(mid)
+                    seen_for_dedup.add(mid)
+
         items_result = await self.db.execute(
-            select(ClothingItem.id, ClothingItem.type).where(ClothingItem.id.in_(valid_ids))
+            select(ClothingItem.id, ClothingItem.type).where(
+                ClothingItem.id.in_(all_ids_for_dedup)
+            )
         )
         item_type_map = {row.id: (row.type or "").lower() for row in items_result}
-        valid_ids = deduplicate_by_body_slot(valid_ids, item_type_map)
+        valid_ids = deduplicate_by_body_slot(
+            valid_ids, item_type_map, mandatory_item_ids=mandatory_item_ids
+        )
+
+        # Ensure mandatory items are present in the final outfit
+        if mandatory_item_ids:
+            existing = set(valid_ids)
+            for mid in mandatory_item_ids:
+                if mid not in existing and mid in item_type_map:
+                    valid_ids.insert(0, mid)
 
         reasoning = outfit_data.get("headline") or outfit_data.get("reasoning")
         style_notes = outfit_data.get("styling_tip") or outfit_data.get("style_notes")
@@ -642,6 +704,11 @@ class RecommendationService:
         exclude_items = exclude_items or []
         include_items = include_items or []
 
+        # Validate mandatory items early — fail fast before any expensive work
+        validated_mandatory: list[ClothingItem] = []
+        if include_items:
+            validated_mandatory = await self._validate_mandatory_items(include_items, user)
+
         if not time_of_day:
             time_of_day = get_time_of_day(user)
 
@@ -686,26 +753,15 @@ class RecommendationService:
             exclude_items=exclude_items,
         )
 
-        # Force-include specific items
-        if include_items:
-            include_set = set(include_items)
-            existing_ids = {item.id for item in candidates}
-            missing_ids = include_set - existing_ids
-
-            if missing_ids:
-                result = await self.db.execute(
-                    select(ClothingItem).where(
-                        and_(
-                            ClothingItem.id.in_(missing_ids),
-                            ClothingItem.user_id == user.id,
-                            ClothingItem.status == ItemStatus.ready,
-                            ClothingItem.is_archived.is_(False),
-                        )
-                    )
-                )
-                forced_items = list(result.scalars().all())
-                candidates.extend(forced_items)
-                logger.info(f"Force-included {len(forced_items)} items in recommendation")
+        # Force-include validated mandatory items into the candidate pool
+        if validated_mandatory:
+            candidate_ids = {item.id for item in candidates}
+            for vi in validated_mandatory:
+                if vi.id not in candidate_ids:
+                    candidates.append(vi)
+            logger.info(
+                f"Force-included {len(validated_mandatory)} mandatory items in recommendation"
+            )
 
         if len(candidates) < 2:
             raise InsufficientWardrobeError(
@@ -738,6 +794,7 @@ class RecommendationService:
                         source,
                         number_map,
                         scheduled_date=scheduled_date,
+                        mandatory_item_ids=set(include_items) if include_items else None,
                     )
 
         # Fetch scoring context
@@ -830,6 +887,7 @@ class RecommendationService:
                     source,
                     number_map,
                     scheduled_date=scheduled_date,
+                    mandatory_item_ids=set(include_items) if include_items else None,
                 )
 
             # Multi-outfit parse
@@ -847,6 +905,7 @@ class RecommendationService:
                 source,
                 number_map,
                 scheduled_date=scheduled_date,
+                mandatory_item_ids=set(include_items) if include_items else None,
             )
 
             # Cache remaining outfits for "Try Another"
@@ -873,6 +932,12 @@ class RecommendationService:
 
 
 class InsufficientWardrobeError(Exception):
+    pass
+
+
+class MandatoryItemError(Exception):
+    """Raised when one or more mandatory include_items cannot be used."""
+
     pass
 
 

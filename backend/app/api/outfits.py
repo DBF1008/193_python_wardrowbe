@@ -28,6 +28,7 @@ from app.services.outfit_service import OutfitListFilters, OutfitService
 from app.services.recommendation_service import (
     AIRecommendationError,
     InsufficientWardrobeError,
+    MandatoryItemError,
     RecommendationService,
 )
 from app.services.studio_service import (
@@ -425,6 +426,11 @@ async def suggest_outfit(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
+        ) from None
+    except MandatoryItemError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error_code": "MANDATORY_ITEM_INVALID", "message": str(e)},
         ) from None
     except AIRecommendationError as e:
         logger.error(f"AI recommendation error: {e}")

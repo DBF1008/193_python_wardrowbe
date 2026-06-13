@@ -37,9 +37,14 @@ ITEM_ROLE: dict[str, str] = {
 }
 
 
-def deduplicate_by_body_slot(item_ids: list[UUID], item_type_map: dict[UUID, str]) -> list[UUID]:
+def deduplicate_by_body_slot(
+    item_ids: list[UUID],
+    item_type_map: dict[UUID, str],
+    mandatory_item_ids: set[UUID] | None = None,
+) -> list[UUID]:
     seen_roles: dict[str, UUID] = {}
     result: list[UUID] = []
+    mandatory = mandatory_item_ids or set()
     has_full_body = any(
         ITEM_ROLE.get(item_type_map.get(iid, "")) == "full_body" for iid in item_ids
     )
@@ -53,9 +58,15 @@ def deduplicate_by_body_slot(item_ids: list[UUID], item_type_map: dict[UUID, str
             result.append(iid)
             continue
         if has_full_body and role in ("base_top", "bottom"):
+            if iid in mandatory:
+                result.append(iid)
+                continue
             logger.warning(f"Removing {item_type} item {iid}: full_body item present")
             continue
         if role in seen_roles:
+            if iid in mandatory:
+                result.append(iid)
+                continue
             logger.warning(
                 f"Removing duplicate {role} item {iid} ({item_type}): "
                 f"role already filled by {seen_roles[role]}"

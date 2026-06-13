@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, date, datetime
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
@@ -336,3 +337,375 @@ class TestPromptPreRanking:
         from app.services.recommendation_service import RECOMMENDATION_PROMPT
 
         assert "pre-ranked" in RECOMMENDATION_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Mandatory include_items regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestDeduplicateByBodySlotMandatory:
+    """deduplicate_by_body_slot must never remove mandatory items."""
+
+    def test_mandatory_base_top_survives_full_body(self):
+        from app.utils.clothing import deduplicate_by_body_slot
+
+        dress_id = uuid4()
+        shirt_id = uuid4()
+        ids = [shirt_id, dress_id]
+        type_map = {shirt_id: "shirt", dress_id: "dress"}
+        result = deduplicate_by_body_slot(ids, type_map, mandatory_item_ids={shirt_id})
+        assert shirt_id in result, "mandatory shirt must survive alongside a dress"
+        assert dress_id in result
+
+    def test_mandatory_bottom_survives_duplicate_role(self):
+        from app.utils.clothing import deduplicate_by_body_slot
+
+        pants_a = uuid4()
+        pants_b = uuid4()
+        ids = [pants_a, pants_b]
+        type_map = {pants_a: "pants", pants_b: "jeans"}
+        # pants_b is mandatory → must not be removed even though pants_a fills the slot first
+        result = deduplicate_by_body_slot(ids, type_map, mandatory_item_ids={pants_b})
+        assert pants_b in result
+
+    def test_non_mandatory_still_deduped(self):
+        from app.utils.clothing import deduplicate_by_body_slot
+
+        pants_a = uuid4()
+        pants_b = uuid4()
+        ids = [pants_a, pants_b]
+        type_map = {pants_a: "pants", pants_b: "jeans"}
+        result = deduplicate_by_body_slot(ids, type_map)
+        # without mandatory, the second bottom is removed
+        assert pants_a in result
+        assert pants_b not in result
+
+    def test_mandatory_none_unchanged(self):
+        from app.utils.clothing import deduplicate_by_body_slot
+
+        shirt = uuid4()
+        pants = uuid4()
+        ids = [shirt, pants]
+        type_map = {shirt: "shirt", pants: "pants"}
+        result = deduplicate_by_body_slot(ids, type_map, mandatory_item_ids=None)
+        assert result == [shirt, pants]
+
+
+class TestMandatoryItemsValidation:
+    """POST /outfits/suggest with invalid include_items must return 400."""
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_item_returns_400(
+        self, client, test_user, auth_headers, db_session
+    ):
+        # Create enough items so the wardrobe check isn't the failure reason
+        for t in ["shirt", "pants", "sneakers"]:
+            db_session.add(
+                ClothingItem(
+                    user_id=test_user.id,
+                    type=t,
+                    image_path=f"test/{uuid4()}.jpg",
+                    status=ItemStatus.ready,
+                    primary_color="blue",
+                )
+            )
+        await db_session.commit()
+
+        fake_id = str(uuid4())
+        response = await client.post(
+            "/api/v1/outfits/suggest",
+            json={
+                "occasion": "casual",
+                "include_items": [fake_id],
+                "weather_override": {"temperature": 20, "condition": "clear"},
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "MANDATORY_ITEM_INVALID"
+        assert fake_id in detail["message"]
+
+    @pytest.mark.asyncio
+    async def test_not_ready_item_returns_400(
+        self, client, test_user, auth_headers, db_session
+    ):
+        processing_item = ClothingItem(
+            user_id=test_user.id,
+            type="shirt",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.processing,
+            primary_color="red",
+        )
+        for t in ["pants", "sneakers"]:
+            db_session.add(
+                ClothingItem(
+                    user_id=test_user.id,
+                    type=t,
+                    image_path=f"test/{uuid4()}.jpg",
+                    status=ItemStatus.ready,
+                    primary_color="blue",
+                )
+            )
+        db_session.add(processing_item)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/v1/outfits/suggest",
+            json={
+                "occasion": "casual",
+                "include_items": [str(processing_item.id)],
+                "weather_override": {"temperature": 20, "condition": "clear"},
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "MANDATORY_ITEM_INVALID"
+
+    @pytest.mark.asyncio
+    async def test_archived_item_returns_400(
+        self, client, test_user, auth_headers, db_session
+    ):
+        archived_item = ClothingItem(
+            user_id=test_user.id,
+            type="shirt",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            is_archived=True,
+            primary_color="green",
+        )
+        for t in ["pants", "sneakers"]:
+            db_session.add(
+                ClothingItem(
+                    user_id=test_user.id,
+                    type=t,
+                    image_path=f"test/{uuid4()}.jpg",
+                    status=ItemStatus.ready,
+                    primary_color="blue",
+                )
+            )
+        db_session.add(archived_item)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/v1/outfits/suggest",
+            json={
+                "occasion": "casual",
+                "include_items": [str(archived_item.id)],
+                "weather_override": {"temperature": 20, "condition": "clear"},
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "MANDATORY_ITEM_INVALID"
+
+    @pytest.mark.asyncio
+    async def test_other_users_item_returns_400(
+        self, client, test_user, auth_headers, db_session
+    ):
+        from app.models.user import User
+
+        other_user = User(
+            id=uuid4(),
+            external_id=f"other-{uuid4()}",
+            email=f"other-{uuid4()}@example.com",
+            display_name="Other",
+            timezone="UTC",
+            is_active=True,
+        )
+        db_session.add(other_user)
+        await db_session.flush()
+
+        other_item = ClothingItem(
+            user_id=other_user.id,
+            type="shirt",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="blue",
+        )
+        for t in ["shirt", "pants", "sneakers"]:
+            db_session.add(
+                ClothingItem(
+                    user_id=test_user.id,
+                    type=t,
+                    image_path=f"test/{uuid4()}.jpg",
+                    status=ItemStatus.ready,
+                    primary_color="blue",
+                )
+            )
+        db_session.add(other_item)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/v1/outfits/suggest",
+            json={
+                "occasion": "casual",
+                "include_items": [str(other_item.id)],
+                "weather_override": {"temperature": 20, "condition": "clear"},
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "MANDATORY_ITEM_INVALID"
+
+
+class TestMandatoryItemsEndToEnd:
+    """Mandatory items must appear in the final outfit even when AI omits them."""
+
+    @pytest.mark.asyncio
+    async def test_mandatory_item_included_when_ai_omits(
+        self, client, test_user, auth_headers, db_session
+    ):
+        """If the AI response doesn't reference a mandatory item, the pipeline
+        must inject it into the materialised outfit."""
+        from decimal import Decimal
+
+        from app.services.ai_service import TextGenerationResult
+
+        test_user.location_lat = Decimal("40.7128")
+        test_user.location_lon = Decimal("-74.0060")
+
+        shirt = ClothingItem(
+            user_id=test_user.id,
+            type="shirt",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="blue",
+        )
+        pants = ClothingItem(
+            user_id=test_user.id,
+            type="pants",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="navy",
+        )
+        sneakers = ClothingItem(
+            user_id=test_user.id,
+            type="sneakers",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="white",
+        )
+        db_session.add_all([shirt, pants, sneakers])
+        await db_session.commit()
+
+        # AI omits the mandatory pants — only selects shirt [1] and sneakers [3].
+        ai_json = json.dumps(
+            {
+                "outfits": [
+                    {
+                        "items": [1, 3],
+                        "headline": "Casual look",
+                        "highlights": ["Comfy", "Simple"],
+                        "styling_tip": "Add a belt",
+                    }
+                ]
+            }
+        )
+
+        async def mock_generate_text(prompt, **kwargs):
+            return TextGenerationResult(
+                content=ai_json, model="test", endpoint="test"
+            )
+
+        with patch(
+            "app.services.recommendation_service.AIService.generate_text",
+            side_effect=mock_generate_text,
+        ):
+            response = await client.post(
+                "/api/v1/outfits/suggest",
+                json={
+                    "occasion": "casual",
+                    "include_items": [str(pants.id)],
+                    "weather_override": {"temperature": 20, "condition": "clear"},
+                },
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        returned_ids = {item["id"] for item in data["items"]}
+        assert str(pants.id) in returned_ids, (
+            "mandatory pants must appear in the outfit even though AI omitted it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mandatory_item_survives_body_slot_conflict(
+        self, client, test_user, auth_headers, db_session
+    ):
+        """A mandatory base_top must not be removed by body-slot dedup when a
+        full_body item (dress) is also in the outfit."""
+        from decimal import Decimal
+
+        from app.services.ai_service import TextGenerationResult
+
+        test_user.location_lat = Decimal("40.7128")
+        test_user.location_lon = Decimal("-74.0060")
+
+        shirt = ClothingItem(
+            user_id=test_user.id,
+            type="shirt",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="white",
+        )
+        dress = ClothingItem(
+            user_id=test_user.id,
+            type="dress",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="black",
+        )
+        sneakers = ClothingItem(
+            user_id=test_user.id,
+            type="sneakers",
+            image_path=f"test/{uuid4()}.jpg",
+            status=ItemStatus.ready,
+            primary_color="white",
+        )
+        db_session.add_all([shirt, dress, sneakers])
+        await db_session.commit()
+
+        # AI selects dress and sneakers, omits the mandatory shirt.
+        ai_json = json.dumps(
+            {
+                "outfits": [
+                    {
+                        "items": [1, 2, 3],
+                        "headline": "Layered look",
+                        "highlights": ["Layered", "Bold"],
+                        "styling_tip": "Roll the sleeves",
+                    }
+                ]
+            }
+        )
+
+        async def mock_generate_text(prompt, **kwargs):
+            return TextGenerationResult(
+                content=ai_json, model="test", endpoint="test"
+            )
+
+        with patch(
+            "app.services.recommendation_service.AIService.generate_text",
+            side_effect=mock_generate_text,
+        ):
+            response = await client.post(
+                "/api/v1/outfits/suggest",
+                json={
+                    "occasion": "casual",
+                    "include_items": [str(shirt.id)],
+                    "weather_override": {"temperature": 20, "condition": "clear"},
+                },
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        returned_ids = {item["id"] for item in data["items"]}
+        assert str(shirt.id) in returned_ids, (
+            "mandatory shirt must survive body-slot dedup against dress"
+        )
