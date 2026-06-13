@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build outputs
+.next/
+dist/
+build/
+*.egg-info/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.local
+.env.production
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+.fastembed_cache/
+
+# Test coverage
+coverage/
+htmlcov/
+.coverage
+
+# Docker volumes (if any local paths are used)
+postgres_data/
+redis_data/
+uploads/
+
+# Kubernetes secrets (NEVER commit actual secrets)
+k8s/secrets.yaml.local
+k8s/*.secret.yaml
+
+# Local development
+*.local
+.claude/
+CLAUDE.md
+deploy.sh
+graphify*
+.graphify*
