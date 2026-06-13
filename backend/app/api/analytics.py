@@ -11,22 +11,17 @@ from app.database import get_db
 from app.models.item import ClothingItem, ItemStatus
 from app.models.outfit import Outfit, OutfitStatus, UserFeedback
 from app.models.user import User
+from app.services.gap_analysis_service import GapAnalysisResult, GapAnalysisService
+from app.services.wardrobe_stats import (
+    ColorDistribution,
+    TypeDistribution,
+    compute_color_distribution,
+    compute_type_distribution,
+)
 from app.utils.auth import get_current_user
 from app.utils.signed_urls import sign_image_url
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
-
-
-class ColorDistribution(BaseModel):
-    color: str
-    count: int
-    percentage: float
-
-
-class TypeDistribution(BaseModel):
-    type: str
-    count: int
-    percentage: float
 
 
 class WearStats(BaseModel):
@@ -154,62 +149,12 @@ async def get_analytics(
         total_wears=total_wears,
     )
 
-    # === Color Distribution ===
-    color_query = (
-        select(
-            ClothingItem.primary_color,
-            func.count(ClothingItem.id).label("count"),
-        )
-        .where(
-            and_(
-                ClothingItem.user_id == current_user.id,
-                ClothingItem.primary_color.isnot(None),
-                ClothingItem.status == ItemStatus.ready,
-            )
-        )
-        .group_by(ClothingItem.primary_color)
-        .order_by(func.count(ClothingItem.id).desc())
-        .limit(10)
-    )
-    color_result = await db.execute(color_query)
-    color_rows = color_result.all()
-
+    # === Color & Type Distribution ===
+    # Shared with the gap-analysis service (app/services/wardrobe_stats.py) so the two
+    # stay numerically consistent.
     ready_items = items_by_status["ready"]
-    color_distribution = [
-        ColorDistribution(
-            color=row.primary_color,
-            count=row.count,
-            percentage=round(row.count / ready_items * 100, 1) if ready_items > 0 else 0,
-        )
-        for row in color_rows
-    ]
-
-    # === Type Distribution ===
-    type_query = (
-        select(
-            ClothingItem.type,
-            func.count(ClothingItem.id).label("count"),
-        )
-        .where(
-            and_(
-                ClothingItem.user_id == current_user.id,
-                ClothingItem.status == ItemStatus.ready,
-            )
-        )
-        .group_by(ClothingItem.type)
-        .order_by(func.count(ClothingItem.id).desc())
-    )
-    type_result = await db.execute(type_query)
-    type_rows = type_result.all()
-
-    type_distribution = [
-        TypeDistribution(
-            type=row.type,
-            count=row.count,
-            percentage=round(row.count / ready_items * 100, 1) if ready_items > 0 else 0,
-        )
-        for row in type_rows
-    ]
+    color_distribution = await compute_color_distribution(db, current_user.id, ready_items)
+    type_distribution = await compute_type_distribution(db, current_user.id, ready_items)
 
     # === Most/Least/Never Worn ===
     def wear_stats_query(order_desc: bool, limit: int, never_worn: bool = False):
@@ -381,3 +326,19 @@ async def get_analytics(
         acceptance_trend=acceptance_trend,
         insights=insights,
     )
+
+
+@router.get("/gaps", response_model=GapAnalysisResult)
+async def get_wardrobe_gaps(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> GapAnalysisResult:
+    """Structured, evidence-backed wardrobe gap analysis.
+
+    Combines type/color distribution (shared with ``GET /analytics``), wear
+    frequency, recommendation acceptance, and learned preferences to surface
+    chronically-short types, over-stocked colors, occasions lacking reliable
+    pairings, and underused items. Degrades to structural-only suggestions when
+    there is no feedback history.
+    """
+    return await GapAnalysisService(db).analyze(current_user.id)
