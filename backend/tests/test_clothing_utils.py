@@ -202,3 +202,49 @@ def test_canonical_order_full_outfit():
 def test_canonical_order_empty_list():
     result = canonical_item_order([], {})
     assert result == []
+
+
+def test_protected_item_survives_duplicate_slot():
+    polo_id, tshirt_id, pants_id = _ids(3)
+    item_type_map = {polo_id: "polo", tshirt_id: "t-shirt", pants_id: "jeans"}
+    # Without protection the first base_top (polo) would claim the slot; the
+    # mandatory t-shirt must win instead even though it appears later.
+    result = deduplicate_by_body_slot(
+        [polo_id, tshirt_id, pants_id], item_type_map, protected_ids={tshirt_id}
+    )
+    assert tshirt_id in result
+    assert polo_id not in result
+    assert pants_id in result
+
+
+def test_protected_top_survives_with_nonprotected_full_body():
+    dress_id, shirt_id, shoes_id = _ids(3)
+    item_type_map = {dress_id: "dress", shirt_id: "shirt", shoes_id: "sneakers"}
+    # A non-protected full_body item cannot evict a mandatory top/bottom.
+    result = deduplicate_by_body_slot(
+        [dress_id, shirt_id, shoes_id], item_type_map, protected_ids={shirt_id}
+    )
+    assert shirt_id in result
+    assert dress_id not in result
+    assert shoes_id in result
+
+
+def test_two_protected_same_slot_both_kept():
+    jeans_id, skirt_id = _ids(2)
+    item_type_map = {jeans_id: "jeans", skirt_id: "skirt"}
+    # The caller explicitly required both, so dedup keeps both.
+    result = deduplicate_by_body_slot(
+        [jeans_id, skirt_id], item_type_map, protected_ids={jeans_id, skirt_id}
+    )
+    assert jeans_id in result
+    assert skirt_id in result
+
+
+def test_protected_ids_empty_matches_default():
+    jeans_id, skirt_id = _ids(2)
+    item_type_map = {jeans_id: "jeans", skirt_id: "skirt"}
+    with_empty = deduplicate_by_body_slot(
+        [jeans_id, skirt_id], item_type_map, protected_ids=set()
+    )
+    default = deduplicate_by_body_slot([jeans_id, skirt_id], item_type_map)
+    assert with_empty == default

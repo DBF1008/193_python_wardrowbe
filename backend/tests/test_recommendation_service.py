@@ -7,11 +7,14 @@ import pytest
 from app.models.item import ClothingItem, ItemStatus
 from app.models.outfit import Outfit, OutfitItem, OutfitSource, OutfitStatus
 from app.models.user import User
+from app.services.ai_service import TextGenerationResult
 from app.services.item_scorer import ScoredItem
 from app.services.recommendation_service import (
+    InvalidMandatoryItemError,
     RecommendationService,
     get_time_of_day,
 )
+from app.services.weather_service import WeatherData
 
 
 def _make_user(timezone: str = "UTC") -> User:
@@ -336,3 +339,236 @@ class TestPromptPreRanking:
         from app.services.recommendation_service import RECOMMENDATION_PROMPT
 
         assert "pre-ranked" in RECOMMENDATION_PROMPT
+
+
+def _other_user() -> User:
+    uid = uuid4()
+    return User(
+        id=uid,
+        external_id=f"other-{uid}",
+        email=f"other-{uid}@example.com",
+        display_name="Other",
+        timezone="UTC",
+        is_active=True,
+    )
+
+
+def _ready_item(user_id, item_type: str = "shirt", **kwargs) -> ClothingItem:
+    defaults = {
+        "id": uuid4(),
+        "user_id": user_id,
+        "type": item_type,
+        "image_path": f"test/{uuid4()}.jpg",
+        "status": ItemStatus.ready,
+        "primary_color": "blue",
+    }
+    defaults.update(kwargs)
+    return ClothingItem(**defaults)
+
+
+def _weather_data() -> WeatherData:
+    return WeatherData(
+        temperature=20.0,
+        feels_like=20.0,
+        humidity=50,
+        precipitation_chance=0,
+        precipitation_mm=0,
+        wind_speed=0,
+        condition="clear",
+        condition_code=0,
+        is_day=True,
+        uv_index=0,
+        timestamp=datetime(2026, 6, 13, 12, 0, 0),
+    )
+
+
+class TestMandatoryItemValidation:
+    @pytest.mark.asyncio
+    async def test_accepts_valid_mandatory(self, db_session, test_user):
+        shirt = _ready_item(test_user.id, "shirt")
+        db_session.add(shirt)
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        result = await service._validate_mandatory_items(test_user, [shirt.id])
+
+        assert [i.id for i in result] == [shirt.id]
+
+    @pytest.mark.asyncio
+    async def test_overrides_needs_wash_soft_filter(self, db_session, test_user):
+        # needs_wash is a soft filter for candidates, but an explicit mandatory
+        # request must still be honoured.
+        item = _ready_item(test_user.id, "shirt", needs_wash=True)
+        db_session.add(item)
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        result = await service._validate_mandatory_items(test_user, [item.id])
+
+        assert item.id in {i.id for i in result}
+
+    @pytest.mark.asyncio
+    async def test_rejects_unowned_item(self, db_session, test_user):
+        other = _other_user()
+        db_session.add(other)
+        await db_session.commit()
+        foreign = _ready_item(other.id, "shirt")
+        db_session.add(foreign)
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        with pytest.raises(InvalidMandatoryItemError) as exc_info:
+            await service._validate_mandatory_items(test_user, [foreign.id])
+
+        assert foreign.id in exc_info.value.item_ids
+
+    @pytest.mark.asyncio
+    async def test_rejects_not_ready_item(self, db_session, test_user):
+        item = _ready_item(test_user.id, "shirt", status=ItemStatus.processing)
+        db_session.add(item)
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        with pytest.raises(InvalidMandatoryItemError) as exc_info:
+            await service._validate_mandatory_items(test_user, [item.id])
+
+        assert item.id in exc_info.value.item_ids
+
+    @pytest.mark.asyncio
+    async def test_rejects_archived_item(self, db_session, test_user):
+        item = _ready_item(test_user.id, "shirt", is_archived=True)
+        db_session.add(item)
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        with pytest.raises(InvalidMandatoryItemError) as exc_info:
+            await service._validate_mandatory_items(test_user, [item.id])
+
+        assert item.id in exc_info.value.item_ids
+
+    @pytest.mark.asyncio
+    async def test_rejects_nonexistent_item(self, db_session, test_user):
+        ghost = uuid4()
+        service = RecommendationService(db_session)
+        with pytest.raises(InvalidMandatoryItemError) as exc_info:
+            await service._validate_mandatory_items(test_user, [ghost])
+
+        assert ghost in exc_info.value.item_ids
+
+    @pytest.mark.asyncio
+    async def test_reports_only_invalid_ids(self, db_session, test_user):
+        good = _ready_item(test_user.id, "shirt")
+        archived = _ready_item(test_user.id, "pants", is_archived=True)
+        db_session.add_all([good, archived])
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        with pytest.raises(InvalidMandatoryItemError) as exc_info:
+            await service._validate_mandatory_items(test_user, [good.id, archived.id])
+
+        assert archived.id in exc_info.value.item_ids
+        assert good.id not in exc_info.value.item_ids
+
+
+class TestMaterializeMandatory:
+    @pytest.mark.asyncio
+    async def test_injects_mandatory_omitted_by_ai(self, db_session, test_user):
+        shirt = _ready_item(test_user.id, "shirt")
+        pants = _ready_item(test_user.id, "pants")
+        db_session.add_all([shirt, pants])
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        number_map = {1: shirt.id, 2: pants.id}
+        # AI selects only pants (2), omitting the mandatory shirt (1).
+        outfit = await service._materialize_outfit(
+            {"items": [2], "headline": "Test"},
+            test_user,
+            _weather_data(),
+            "casual",
+            OutfitSource.on_demand,
+            number_map,
+            mandatory_item_ids={shirt.id},
+        )
+
+        item_ids = {oi.item_id for oi in outfit.items}
+        assert shirt.id in item_ids
+        assert pants.id in item_ids
+
+    @pytest.mark.asyncio
+    async def test_mandatory_wins_body_slot_conflict(self, db_session, test_user):
+        dress = _ready_item(test_user.id, "dress")
+        shirt = _ready_item(test_user.id, "shirt")
+        shoes = _ready_item(test_user.id, "sneakers")
+        db_session.add_all([dress, shirt, shoes])
+        await db_session.commit()
+
+        service = RecommendationService(db_session)
+        number_map = {1: dress.id, 2: shirt.id, 3: shoes.id}
+        # AI picks a dress (full_body) alongside the mandatory shirt; dedup must
+        # drop the dress, not the mandatory top.
+        outfit = await service._materialize_outfit(
+            {"items": [1, 2, 3], "headline": "Test"},
+            test_user,
+            _weather_data(),
+            "casual",
+            OutfitSource.on_demand,
+            number_map,
+            mandatory_item_ids={shirt.id},
+        )
+
+        item_ids = {oi.item_id for oi in outfit.items}
+        assert shirt.id in item_ids
+        assert dress.id not in item_ids
+        assert shoes.id in item_ids
+
+
+class TestSuggestMandatoryEndToEnd:
+    @pytest.mark.asyncio
+    async def test_invalid_include_items_returns_422(self, client, test_user, auth_headers):
+        response = await client.post(
+            "/api/v1/outfits/suggest",
+            json={
+                "occasion": "casual",
+                "weather_override": {"temperature": 20, "condition": "clear"},
+                "include_items": [str(uuid4())],
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert detail["error_code"] == "INVALID_INCLUDE_ITEMS"
+
+    @pytest.mark.asyncio
+    async def test_mandatory_item_present_in_result(
+        self, client, test_user, auth_headers, db_session
+    ):
+        shirt = _ready_item(test_user.id, "shirt")
+        pants = _ready_item(test_user.id, "pants")
+        shoes = _ready_item(test_user.id, "sneakers")
+        db_session.add_all([shirt, pants, shoes])
+        await db_session.commit()
+
+        # AI deliberately omits the mandatory item (sorted to number [1]);
+        # enforcement must still place it in the final outfit.
+        ai_result = TextGenerationResult(
+            content='{"outfits": [{"items": [2, 3], "headline": "X"}]}',
+            model="test-model",
+            endpoint="test-endpoint",
+        )
+        with patch("app.services.recommendation_service.AIService") as mock_ai_cls:
+            mock_ai_cls.return_value.generate_text = AsyncMock(return_value=ai_result)
+            response = await client.post(
+                "/api/v1/outfits/suggest",
+                json={
+                    "occasion": "casual",
+                    "weather_override": {"temperature": 20, "condition": "clear"},
+                    "include_items": [str(shirt.id)],
+                },
+                headers=auth_headers,
+            )
+
+        assert response.status_code == 200, response.text
+        item_ids = {item["id"] for item in response.json()["items"]}
+        assert str(shirt.id) in item_ids

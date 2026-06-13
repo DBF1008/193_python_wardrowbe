@@ -111,6 +111,44 @@ class RecommendationService:
 
         return items
 
+    async def _validate_mandatory_items(
+        self, user: User, include_items: list[UUID]
+    ) -> list[ClothingItem]:
+        """Validate force-included items and return them as ``ClothingItem`` objects.
+
+        Raises ``InvalidMandatoryItemError`` if any requested id is missing, not
+        owned by the user, not in ``ready`` status, or archived. Soft filters
+        (``needs_wash``, excluded-item preferences) are intentionally NOT applied:
+        an explicit mandatory request overrides them.
+        """
+        requested = list(dict.fromkeys(include_items))  # de-dup, preserve order
+        if not requested:
+            return []
+
+        result = await self.db.execute(
+            select(ClothingItem).where(
+                and_(
+                    ClothingItem.id.in_(requested),
+                    ClothingItem.user_id == user.id,
+                )
+            )
+        )
+        owned = {item.id: item for item in result.scalars().all()}
+
+        invalid: list[UUID] = []
+        valid: list[ClothingItem] = []
+        for item_id in requested:
+            item = owned.get(item_id)
+            if item is None or item.status != ItemStatus.ready or item.is_archived:
+                invalid.append(item_id)
+            else:
+                valid.append(item)
+
+        if invalid:
+            raise InvalidMandatoryItemError(invalid)
+
+        return valid
+
     async def _get_recently_worn_dates(self, user: User) -> dict[UUID, date]:
         result = await self.db.execute(
             select(ClothingItem.id, ClothingItem.last_worn_at).where(
@@ -544,6 +582,7 @@ class RecommendationService:
         source: OutfitSource,
         number_map: dict[int, UUID],
         scheduled_date: date | None = None,
+        mandatory_item_ids: set[UUID] | None = None,
     ) -> Outfit:
         selected_numbers = outfit_data.get("items", [])
         valid_ids = []
@@ -566,15 +605,36 @@ class RecommendationService:
                 unique_ids.append(item_id)
         valid_ids = unique_ids
 
+        # Enforce mandatory items: inject any the AI failed to select so the
+        # required items always appear in the final outfit.
+        if mandatory_item_ids:
+            selected = set(valid_ids)
+            for mid in mandatory_item_ids:
+                if mid not in selected:
+                    valid_ids.append(mid)
+                    selected.add(mid)
+                    logger.info(f"Injected mandatory item {mid} omitted by AI")
+
         if not valid_ids:
             raise AIRecommendationError("AI did not select any valid items")
 
-        # Deduplicate by body slot (e.g. prevent shorts + pants)
+        # Deduplicate by body slot (e.g. prevent shorts + pants). Mandatory items
+        # are protected so they win their slot and are never dropped here.
         items_result = await self.db.execute(
             select(ClothingItem.id, ClothingItem.type).where(ClothingItem.id.in_(valid_ids))
         )
         item_type_map = {row.id: (row.type or "").lower() for row in items_result}
-        valid_ids = deduplicate_by_body_slot(valid_ids, item_type_map)
+        valid_ids = deduplicate_by_body_slot(
+            valid_ids, item_type_map, protected_ids=mandatory_item_ids
+        )
+
+        # Post-condition: every mandatory item must be present after dedup.
+        if mandatory_item_ids:
+            missing_mandatory = [m for m in mandatory_item_ids if m not in set(valid_ids)]
+            if missing_mandatory:
+                raise AIRecommendationError(
+                    f"Failed to include required items in outfit: {missing_mandatory}"
+                )
 
         reasoning = outfit_data.get("headline") or outfit_data.get("reasoning")
         style_notes = outfit_data.get("styling_tip") or outfit_data.get("style_notes")
@@ -686,26 +746,20 @@ class RecommendationService:
             exclude_items=exclude_items,
         )
 
-        # Force-include specific items
+        # Validate and force-include mandatory items.
+        # Validation raises InvalidMandatoryItemError for any id that is not owned,
+        # not ready, archived, or missing, so an invalid request fails loudly
+        # instead of silently producing an outfit without the required items.
         if include_items:
-            include_set = set(include_items)
+            validated_mandatory = await self._validate_mandatory_items(user, include_items)
             existing_ids = {item.id for item in candidates}
-            missing_ids = include_set - existing_ids
+            for item in validated_mandatory:
+                if item.id not in existing_ids:
+                    candidates.append(item)
+                    existing_ids.add(item.id)
+            logger.info(f"Force-included {len(validated_mandatory)} mandatory items")
 
-            if missing_ids:
-                result = await self.db.execute(
-                    select(ClothingItem).where(
-                        and_(
-                            ClothingItem.id.in_(missing_ids),
-                            ClothingItem.user_id == user.id,
-                            ClothingItem.status == ItemStatus.ready,
-                            ClothingItem.is_archived.is_(False),
-                        )
-                    )
-                )
-                forced_items = list(result.scalars().all())
-                candidates.extend(forced_items)
-                logger.info(f"Force-included {len(forced_items)} items in recommendation")
+        mandatory_ids: set[UUID] | None = set(include_items) if include_items else None
 
         if len(candidates) < 2:
             raise InsufficientWardrobeError(
@@ -763,7 +817,7 @@ class RecommendationService:
             learned_prefs=learned_prefs,
             good_pairs=good_pairs,
             recently_worn_dates=recently_worn_dates,
-            mandatory_item_ids=set(include_items) if include_items else None,
+            mandatory_item_ids=mandatory_ids,
         )
 
         # Format enriched prompt
@@ -830,6 +884,7 @@ class RecommendationService:
                     source,
                     number_map,
                     scheduled_date=scheduled_date,
+                    mandatory_item_ids=mandatory_ids,
                 )
 
             # Multi-outfit parse
@@ -847,6 +902,7 @@ class RecommendationService:
                 source,
                 number_map,
                 scheduled_date=scheduled_date,
+                mandatory_item_ids=mandatory_ids,
             )
 
             # Cache remaining outfits for "Try Another"
@@ -878,3 +934,19 @@ class InsufficientWardrobeError(Exception):
 
 class AIRecommendationError(Exception):
     pass
+
+
+class InvalidMandatoryItemError(Exception):
+    """Raised when a force-included (mandatory) item cannot be used.
+
+    An item is invalid if it does not exist, does not belong to the user, is not
+    in ``ready`` status, or is archived. ``item_ids`` holds the offending ids.
+    """
+
+    def __init__(self, item_ids: list[UUID]):
+        self.item_ids = item_ids
+        ids_str = ", ".join(str(i) for i in item_ids)
+        super().__init__(
+            "One or more required items cannot be included because they are "
+            f"unavailable (not found, not ready, or archived): {ids_str}"
+        )
