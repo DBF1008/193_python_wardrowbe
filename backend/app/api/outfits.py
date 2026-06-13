@@ -494,7 +494,10 @@ async def list_outfits(
 
     outfits, total = await service.list_with_filters(filters, page, page_size)
 
-    wore_instead_map = await fetch_wore_instead_items_map(db, outfits, user_id=current_user.id)
+    # Resolve wore-instead items against the *target* user's wardrobe so that
+    # family-member views see the member's own replacement items instead of
+    # silently filtering them out through the current user's scope.
+    wore_instead_map = await fetch_wore_instead_items_map(db, outfits, user_id=target_user_id)
 
     outfit_responses = [outfit_to_response(o, wore_instead_map) for o in outfits]
 
