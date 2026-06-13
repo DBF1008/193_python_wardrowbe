@@ -252,6 +252,72 @@ async def test_wear_today_requires_template(db_session, studio_user, wardrobe_it
 
 
 @pytest.mark.asyncio
+async def test_wear_today_respects_explicit_scheduled_for(db_session, studio_user, wardrobe_items):
+    # Explicit-date scenario: a caller-supplied scheduled_for must be honored verbatim
+    # and never overridden by "today" in any timezone.
+    service = StudioService(db_session)
+    shirt, jeans = wardrobe_items[0], wardrobe_items[1]
+
+    template = await service.create_from_scratch(
+        user=studio_user,
+        item_ids=[shirt.id, jeans.id],
+        occasion="casual",
+        name="Daily look",
+        scheduled_for=None,
+        mark_worn=False,
+        source_item_id=None,
+    )
+    await db_session.commit()
+
+    explicit = date(2030, 6, 1)
+    wear = await service.wear_today(
+        user=studio_user, template_id=template.id, scheduled_for=explicit
+    )
+    await db_session.commit()
+
+    assert wear.scheduled_for == explicit
+    assert wear.feedback.worn_at == explicit
+
+
+@pytest.mark.asyncio
+async def test_wear_today_defaults_to_user_timezone_today(
+    db_session, studio_user, wardrobe_items, monkeypatch
+):
+    # Omitted-date scenario: when scheduled_for is None the landing date must come from
+    # the user's timezone-aware "today" (get_user_today), not the server's local
+    # date.today(). Patching the timezone helper to a sentinel proves the default is
+    # sourced from it and that the corrected date propagates to both the outfit's
+    # scheduled_for (recommendation dedup) and the synthetic feedback worn_at (wear stats).
+    service = StudioService(db_session)
+    shirt, jeans, sneakers = wardrobe_items[0], wardrobe_items[1], wardrobe_items[2]
+
+    template = await service.create_from_scratch(
+        user=studio_user,
+        item_ids=[shirt.id, jeans.id, sneakers.id],
+        occasion="casual",
+        name="Daily look",
+        scheduled_for=None,
+        mark_worn=False,
+        source_item_id=None,
+    )
+    await db_session.commit()
+
+    user_tz_today = date(2031, 2, 2)
+    assert user_tz_today != date.today()  # sentinel must differ from the server's today
+    monkeypatch.setattr(
+        "app.services.studio_service.get_user_today", lambda user: user_tz_today
+    )
+
+    wear = await service.wear_today(
+        user=studio_user, template_id=template.id, scheduled_for=None
+    )
+    await db_session.commit()
+
+    assert wear.scheduled_for == user_tz_today
+    assert wear.feedback.worn_at == user_tz_today
+
+
+@pytest.mark.asyncio
 async def test_patch_outfit_name(db_session, studio_user, wardrobe_items):
     service = StudioService(db_session)
     shirt = wardrobe_items[0]
