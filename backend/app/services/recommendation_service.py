@@ -76,14 +76,19 @@ class RecommendationService:
         self.db = db
         self.weather_service = WeatherService()
 
-    async def get_candidate_items(
+    async def get_available_items(
         self,
         user: User,
-        weather: WeatherData,
-        occasion: str,
-        preferences: UserPreference | None,
-        exclude_items: list[UUID],
+        exclude_items: list[UUID] | None = None,
     ) -> list[ClothingItem]:
+        """Items eligible to appear in a recommendation.
+
+        Ready, not archived, not needing a wash, with a known type, minus any
+        ``exclude_items`` and the user's ``excluded_item_ids`` preference. This
+        is the single definition of "available" — shared by recommendation
+        generation (via :meth:`get_candidate_items`) and the weekly planner's
+        risk counting, so the two never drift.
+        """
         query = select(ClothingItem).where(
             and_(
                 ClothingItem.user_id == user.id,
@@ -105,11 +110,22 @@ class RecommendationService:
             exclude_set = set(exclude_items)
             items = [i for i in items if i.id not in exclude_set]
 
+        preferences = user.preferences
         if preferences and preferences.excluded_item_ids:
             excluded = set(preferences.excluded_item_ids)
             items = [i for i in items if i.id not in excluded]
 
         return items
+
+    async def get_candidate_items(
+        self,
+        user: User,
+        weather: WeatherData,
+        occasion: str,
+        preferences: UserPreference | None,
+        exclude_items: list[UUID],
+    ) -> list[ClothingItem]:
+        return await self.get_available_items(user, exclude_items=exclude_items)
 
     async def _get_recently_worn_dates(self, user: User) -> dict[UUID, date]:
         result = await self.db.execute(

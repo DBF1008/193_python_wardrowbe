@@ -1,7 +1,6 @@
 import logging
 import os
 from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, select
 from sqlalchemy.orm import selectinload
@@ -24,8 +23,10 @@ from app.services.notification_providers import (
 )
 from app.services.notification_service import DeliveryStatus, NotificationDispatcher
 from app.services.recommendation_service import RecommendationService
+from app.services.schedule_planner import fires_on, wear_date_for_reminder_today
 from app.services.weather_service import WeatherService
 from app.utils.redis_lock import distributed_lock
+from app.utils.timezone import get_user_timezone, get_user_today
 from app.workers.db import get_db_session
 
 logger = logging.getLogger(__name__)
@@ -203,9 +204,8 @@ async def process_scheduled_notification(ctx: dict, schedule_id: str):
             except Exception as e:
                 logger.warning(f"Failed to fetch tomorrow's weather: {e}")
 
-        user_tz = ZoneInfo(user.timezone or "UTC")
-        user_today = datetime.now(UTC).astimezone(user_tz).date()
-        target_date = user_today + timedelta(days=1) if is_for_tomorrow else user_today
+        user_today = get_user_today(user)
+        target_date = wear_date_for_reminder_today(schedule, user_today)
 
         recommendation_service = RecommendationService(db)
         outfit = await recommendation_service.generate_recommendation(
@@ -266,25 +266,15 @@ async def check_scheduled_notifications(ctx: dict):
 
         to_enqueue: list[Schedule] = []
         for schedule in schedules:
-            try:
-                user_tz = ZoneInfo(schedule.user.timezone or "UTC")
-            except (KeyError, ValueError):
-                user_tz = ZoneInfo("UTC")
-
+            user_tz = get_user_timezone(schedule.user)
             now_local = now_utc.astimezone(user_tz)
-            local_day = now_local.weekday()
-            local_minutes = now_local.hour * 60 + now_local.minute
-            tomorrow_local_day = (local_day + 1) % 7
 
-            day_match = (not schedule.notify_day_before and schedule.day_of_week == local_day) or (
-                schedule.notify_day_before and schedule.day_of_week == tomorrow_local_day
-            )
-            if not day_match:
+            fire_at = fires_on(schedule, now_local)
+            if fire_at is None:
                 continue
 
-            schedule_minutes = (
-                schedule.notification_time.hour * 60 + schedule.notification_time.minute
-            )
+            schedule_minutes = fire_at.hour * 60 + fire_at.minute
+            local_minutes = now_local.hour * 60 + now_local.minute
             if abs(schedule_minutes - local_minutes) > 1:
                 continue
 

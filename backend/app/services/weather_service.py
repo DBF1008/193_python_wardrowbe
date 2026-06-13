@@ -94,6 +94,31 @@ CACHE_TTL = 3600  # 1 hour
 CACHE_PREFIX = "weather:"
 
 
+def daily_forecast_to_weather(forecast: DailyForecast) -> WeatherData:
+    """Convert a daily forecast into a representative :class:`WeatherData`.
+
+    Uses the average of min/max as the temperature, the max as ``feels_like``
+    (daytime outfit), and fills daily-unavailable fields with sensible
+    defaults. Shared by day-before notifications (``get_tomorrow_weather``) and
+    the weekly planner's future-date generation, so the transform stays
+    consistent.
+    """
+    avg_temp = (forecast.temp_min + forecast.temp_max) / 2
+    return WeatherData(
+        temperature=round(avg_temp, 1),
+        feels_like=round(forecast.temp_max, 1),
+        humidity=50,  # Not available in daily forecast, use typical value
+        precipitation_chance=forecast.precipitation_chance,
+        precipitation_mm=0,  # Not available for forecast
+        wind_speed=0,  # Not available in daily forecast
+        condition=forecast.condition,
+        condition_code=forecast.condition_code,
+        is_day=True,  # Assume daytime for outfit recommendations
+        uv_index=0,  # Not available in daily forecast
+        timestamp=datetime.utcnow(),
+    )
+
+
 class WeatherService:
     def __init__(self):
         self.base_url = settings.openmeteo_url
@@ -310,25 +335,7 @@ class WeatherService:
             return await self.get_current_weather(latitude, longitude)
 
         tomorrow = forecasts[1]  # Index 0 is today, 1 is tomorrow
-
-        # Use average of min/max for the representative temperature
-        avg_temp = (tomorrow.temp_min + tomorrow.temp_max) / 2
-        # Use the max temp for feels_like (daytime outfit)
-        feels_like = tomorrow.temp_max
-
-        return WeatherData(
-            temperature=round(avg_temp, 1),
-            feels_like=round(feels_like, 1),
-            humidity=50,  # Not available in daily forecast, use typical value
-            precipitation_chance=tomorrow.precipitation_chance,
-            precipitation_mm=0,  # Not available for forecast
-            wind_speed=0,  # Not available in daily forecast
-            condition=tomorrow.condition,
-            condition_code=tomorrow.condition_code,
-            is_day=True,  # Assume daytime for outfit recommendations
-            uv_index=0,  # Not available in daily forecast
-            timestamp=datetime.utcnow(),
-        )
+        return daily_forecast_to_weather(tomorrow)
 
     async def check_health(self) -> dict:
         """Check if the weather service is available."""
